@@ -1,0 +1,79 @@
+name: Follow Kairos releases
+
+# Daily: when Kairos publishes a release (vX.Y.Z), pin the kairos-init it uses
+# (and the provider-kairos that kairos-init bundles, which our k0s patch
+# rebuilds), tag vX.Y.Z on main and start the release build (build.yml), which
+# checks, tests and publishes it.
+#
+# If that build failed, the tag stays without a GitHub release. The next run
+# retries once main has moved on (i.e. after a fix was pushed): it moves the
+# unreleased tag to main and builds again. Published releases are never moved.
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: follow-kairos
+
+permissions:
+  contents: write   # commit the kairos-init bump, push the tag
+  actions: write    # start build.yml
+
+jobs:
+  follow:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Release the latest Kairos version
+        run: |
+          set -euo pipefail
+          # Latest non-prerelease
+          latest=$(gh release view --repo kairos-io/kairos --json tagName -q .tagName)
+          echo "Latest Kairos release: $latest"
+
+          if gh release view "$latest" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$latest is already released"
+            exit 0
+          fi
+          running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --branch "$latest" \
+            --json status -q '[.[] | select(.status != "completed")] | length')
+          if [[ $running != 0 ]]; then
+            echo "A build of $latest is still running"
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/$latest" >/dev/null \
+             && [[ $(git rev-list -n1 "$latest") == $(git rev-parse HEAD) ]]; then
+            echo "::warning::$latest is tagged on the current main but has no release: its build failed. Push a fix to main to retry."
+            exit 0
+          fi
+
+          init=$(curl -fsSL "https://raw.githubusercontent.com/kairos-io/kairos/$latest/images/Dockerfile" \
+            | sed -n 's/^ARG KAIROS_INIT=//p')
+          [[ -n $init ]] || { echo "::error::no KAIROS_INIT in Kairos $latest images/Dockerfile"; exit 1; }
+          provider=$(docker run --rm "quay.io/kairos/kairos-init:$init" version 2>&1 \
+            | grep -o 'provider-kairos: v[0-9.]*' | cut -d' ' -f2)
+          [[ -n $provider ]] || { echo "::error::no provider-kairos version in kairos-init $init"; exit 1; }
+
+          sed -i -e "s/^ARG KAIROS_INIT=.*/ARG KAIROS_INIT=$init/" \
+                 -e "s/^ARG PROVIDER_KAIROS=.*/ARG PROVIDER_KAIROS=$provider/" Dockerfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet Dockerfile; then
+            git commit -q -m "Follow Kairos $latest: kairos-init $init, provider-kairos $provider" Dockerfile
+            git push origin HEAD:main
+          fi
+
+          # (Re)tag; only ever an unreleased tag gets moved.
+          git tag -f -a "$latest" -m "Kairos $latest on Alpine"
+          git push -f origin "refs/tags/$latest"
+
+          # Tags pushed with GITHUB_TOKEN don't trigger workflows; a dispatch does.
+          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref "$latest"
+          echo "Started the release build of $latest" | tee -a "$GITHUB_STEP_SUMMARY"

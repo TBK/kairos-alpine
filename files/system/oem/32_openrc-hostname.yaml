@@ -1,0 +1,21 @@
+# Kairos derives the default hostname from the machine ID in the initramfs
+# stage (31_hosts.yaml: kairos-{{ trunc 4 .MachineID }}), and yip renders that
+# template when it loads the stage. On OpenRC the machine ID is only created by
+# a step of that same stage (00_rootfs.yaml), so the first boot renders
+# "kairos-" and saves it as the permanent hostname: an invalid Kubernetes node
+# name, and the same on every machine. systemd distributions don't hit this,
+# systemd creates the machine ID first.
+stages:
+  initramfs.before:
+    - name: "Create the machine ID before the hostname is derived from it"
+      only_service_manager: "openrc"
+      if: '[ ! -f "/run/cos/recovery_mode" ] && [ ! -s /etc/machine-id ]'
+      commands:
+        - dbus-uuidgen --ensure
+        - cat /var/lib/dbus/machine-id > /etc/machine-id
+  boot:
+    # Machines installed before this fix saved "kairos-" as their hostname.
+    - name: "Repair the hostname 'kairos-'"
+      only_service_manager: "openrc"
+      if: '[ ! -f "/run/cos/recovery_mode" ] && [ "$(cat /etc/hostname 2>/dev/null)" = "kairos-" ]'
+      hostname: kairos-{{ trunc 4 .MachineID }}

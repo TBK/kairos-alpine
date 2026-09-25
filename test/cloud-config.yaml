@@ -1,0 +1,9 @@
+#cloud-config
+install:
+  auto: true
+  device: auto
+  poweroff: true
+users:
+  - name: kairos
+    passwd: kairos
+    groups: [admin]

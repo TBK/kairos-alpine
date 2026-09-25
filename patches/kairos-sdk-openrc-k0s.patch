@@ -1,0 +1,33 @@
+kairos-sdk: let OpenRC services take command arguments for k0s
+
+machine/openrc ServiceUnit.OverrideCmd only knows k3s: it fails with "no k3s
+binary found (?)" on a k0s system, so provider-kairos can't start k0s on
+OpenRC (Alpine). For k0s, write command_args to /etc/k0s/<service>.args (a
+persistent path, next to the <service>.env the provider writes); the k0s init
+scripts in our image source it (see Dockerfile). k3s is unchanged.
+
+Upstream: kairos-io/kairos#4529 (make services generic over the init system).
+Drop this patch once a kairos-sdk release fixes it; the build fails when it
+no longer applies.
+
+--- a/machine/openrc/unit.go
++++ b/machine/openrc/unit.go
+@@ -60,6 +60,18 @@
+ 
+ // TODO: This is too much k3s specific.
+ func (s ServiceUnit) OverrideCmd(cmd string) error {
++	// k0s: the init scripts source command_args from /etc/k0s/<service>.args,
++	// next to the <service>.env file. /etc/k0s is a persistent path.
++	if k0sbin := utils.K0sBin(); k0sbin != "" && strings.HasPrefix(cmd, k0sbin+" ") {
++		argsFile := filepath.Join(s.rootdir, "/etc/k0s", s.name+".args")
++		if err := os.MkdirAll(filepath.Dir(argsFile), 0755); err != nil {
++			return err
++		}
++		return utils.WriteEnv(argsFile, map[string]string{
++			"command_args": strings.TrimSpace(strings.TrimPrefix(cmd, k0sbin+" ")),
++		})
++	}
++
+ 	k3sbin := utils.K3sBin()
+ 	if k3sbin == "" {
+ 		return fmt.Errorf("no k3s binary found (?)")

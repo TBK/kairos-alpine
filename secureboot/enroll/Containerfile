@@ -1,0 +1,10 @@
+# Builds sb-enroll.efi for the target platform:
+#   podman build --platform linux/amd64 -o type=local,dest=out secureboot/enroll
+ARG ALPINE_VERSION=3.24
+FROM docker.io/library/alpine:${ALPINE_VERSION} AS build
+RUN apk add --no-cache build-base gnu-efi-dev gnu-efi
+COPY Makefile sb-enroll.c /src/
+RUN make -C /src
+
+FROM scratch
+COPY --from=build /src/sb-enroll.efi /

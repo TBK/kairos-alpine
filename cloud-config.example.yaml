@@ -1,0 +1,14 @@
+#cloud-config
+# Example config for the server. Either paste it into the web UI at
+# http://<live-ip>:8080 / the interactive installer, or bake it into the ISO:
+#   CLOUD_CONFIG=cloud-config.yaml ./build.sh    (makes it auto-install!)
+hostname: myserver
+install:
+  auto: true          # wipes the target disk without asking
+  device: /dev/sda    # set explicitly on real hardware ("auto" = largest disk)
+  reboot: true        # remove the USB stick before it comes back up
+users:
+  - name: kairos
+    groups: [admin]
+    ssh_authorized_keys:
+      - github:YOUR_GITHUB_USER   # or a literal "ssh-ed25519 AAAA..." key

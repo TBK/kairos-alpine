@@ -1,0 +1,57 @@
+name: Alpine updates
+
+# Daily: if the latest release's image has Alpine packages with updates
+# available (Alpine's stable branches only get security and bug fixes), rebuild
+# that release with build.yml. The rebuild is tested like any release and
+# replaces the published images and ISOs under the same version. Servers pick
+# it up with an explicit `kairos-agent upgrade --source oci:<image>`, since
+# the version number doesn't change.
+on:
+  schedule:
+    - cron: '43 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read   # pull the released image
+  actions: write   # start build.yml
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the latest release for Alpine updates
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null) \
+            || { echo "No release yet"; exit 0; }
+          running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --branch "$tag" \
+            --json status -q '[.[] | select(.status != "completed")] | length')
+          if [[ $running != 0 ]]; then
+            echo "A build of $tag is already running"
+            exit 0
+          fi
+
+          # Alpine version the release was built with, not main's
+          git fetch -q --depth 1 origin tag "$tag"
+          alpine=$(git show "$tag:.github/workflows/build.yml" | sed -n "s/^  ALPINE_VERSION: '\(.*\)'/\1/p")
+          [[ -n $alpine ]] || { echo "::error::no ALPINE_VERSION in build.yml at $tag"; exit 1; }
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kairos-alpine:${alpine}-core-amd64-generic-${tag}"
+          echo "$GH_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          updates=$(podman run --rm "$image" sh -c 'apk update -q >/dev/null && apk list -u 2>/dev/null')
+          if [[ -z $updates ]]; then
+            echo "$image is up to date"
+            exit 0
+          fi
+
+          {
+            echo "### $tag: $(wc -l <<< "$updates") Alpine package updates, rebuilding"
+            echo '```'
+            echo "$updates"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref "$tag"

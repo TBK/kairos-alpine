@@ -1,0 +1,5 @@
+build/
+test/work/*
+!test/work/sb/certs/
+secureboot/private/
+.git/

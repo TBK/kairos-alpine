@@ -1,0 +1,366 @@
+name: Build
+
+# PRs / main: build every arch+variant, run the VM install test (amd64) and a
+#             Secure Boot install test with throwaway keys.
+# Tag vX.Y.Z:  a release. X.Y.Z is the Kairos release whose kairos-init we pin
+#             (checked). Same builds and tests; only when all of them pass does
+#             "publish" push the images to GHCR and put the ISOs plus the
+#             Secure Boot enrollment ISO on the GitHub release.
+#             Running this on an already published tag (workflow_dispatch)
+#             rebuilds it with current Alpine packages and re-publishes it.
+#
+# follow-kairos.yml creates release tags, alpine-updates.yml triggers rebuilds.
+#
+# Secure Boot signing needs secureboot/certs committed and the SB_DB_KEY
+# secret (secureboot/genkeys.sh). Without them builds are unsigned, and
+# releases fail.
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  ALPINE_VERSION: '3.24'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            # The tag names the Kairos release; it must pin the same kairos-init.
+            ours=$(sed -n 's/^ARG KAIROS_INIT=//p' Dockerfile)
+            upstream=$(curl -fsSL "https://raw.githubusercontent.com/kairos-io/kairos/$GITHUB_REF_NAME/images/Dockerfile" \
+              | sed -n 's/^ARG KAIROS_INIT=//p') \
+              || { echo "::error::$GITHUB_REF_NAME is not a Kairos release"; exit 1; }
+            if [[ $ours != "$upstream" ]]; then
+              echo "::error::Kairos $GITHUB_REF_NAME uses kairos-init $upstream, our Dockerfile has $ours"
+              exit 1
+            fi
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # The VM install test (amd64) starts Kubernetes on the standard
+        # variants and waits for a Ready node.
+        include:
+          - { name: core-amd64,         arch: amd64,   variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: true,  experimental: false }
+          - { name: standard-k3s-amd64, arch: amd64,   variant: standard, provider: k3s, runner: ubuntu-24.04,     e2e: true,  experimental: false }
+          - { name: standard-k0s-amd64, arch: amd64,   variant: standard, provider: k0s, runner: ubuntu-24.04,     e2e: true,  experimental: false }
+          - { name: core-arm64,         arch: arm64,   variant: core,     provider: '',  runner: ubuntu-24.04-arm, e2e: false, experimental: false }
+          - { name: standard-k3s-arm64, arch: arm64,   variant: standard, provider: k3s, runner: ubuntu-24.04-arm, e2e: false, experimental: false }
+          - { name: standard-k0s-arm64, arch: arm64,   variant: standard, provider: k0s, runner: ubuntu-24.04-arm, e2e: false, experimental: false }
+          # No native riscv64 runners: built under qemu-user emulation (slow).
+          # No standard variants: k3s and k0s publish no riscv64 releases.
+          - { name: core-riscv64,       arch: riscv64, variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: false, experimental: true }
+    env:
+      ARCH: ${{ matrix.arch }}
+      VARIANT: ${{ matrix.variant }}
+      K8S_PROVIDER: ${{ matrix.provider }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE: ${{ needs.prepare.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          pkgs=(podman)
+          if ${{ matrix.e2e }}; then pkgs+=(qemu-system-x86 qemu-utils ovmf); fi
+          sudo apt-get install -y -qq "${pkgs[@]}"
+
+      - name: Set up QEMU user emulation
+        if: matrix.arch == 'riscv64'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: riscv64
+
+      # shim needs the certificate, and riscv64 has no shim: never signed.
+      - name: Secure Boot signing key
+        if: matrix.arch != 'riscv64'
+        env:
+          SB_DB_KEY: ${{ secrets.SB_DB_KEY }}
+        run: |
+          if [[ -n $SB_DB_KEY && -f secureboot/certs/db.der ]]; then
+            install -m 600 /dev/null "$RUNNER_TEMP/db.key"
+            printf '%s\n' "$SB_DB_KEY" > "$RUNNER_TEMP/db.key"
+            echo "SB_DB_KEY_FILE=$RUNNER_TEMP/db.key" >> "$GITHUB_ENV"
+            echo "Signing for Secure Boot"
+          elif [[ $RELEASE == true ]]; then
+            echo "::error::Releases must be signed. Commit secureboot/certs and set the SB_DB_KEY secret (see secureboot/genkeys.sh)."
+            exit 1
+          else
+            echo "::warning::Not signed for Secure Boot (no SB_DB_KEY secret or no secureboot/certs/db.der)"
+          fi
+
+      # Rootful podman: avoids user-namespace restrictions on the runners.
+      - name: Build image and ISO
+        run: |
+          sudo -E ./build.sh | tee "$RUNNER_TEMP/image-ref"
+          image=$(tail -n1 "$RUNNER_TEMP/image-ref")
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "TAG=${image##*:}" >> "$GITHUB_ENV"
+          sudo chown -R "$USER" build
+          ls -lh build/
+
+      - name: Enable KVM
+        if: matrix.e2e
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: VM install test
+        if: matrix.e2e
+        run: |
+          config=test/cloud-config${K8S_PROVIDER:+-$K8S_PROVIDER}.yaml
+          sudo -E env CLOUD_CONFIG="$config" ISO_NAME=autoinstall-test ./build.sh >/dev/null
+          sudo chown -R "$USER" build
+          test/e2e.sh build/autoinstall-test.iso "$VARIANT"
+          rm -f build/autoinstall-test.iso*
+
+      - name: Upload serial log on failure
+        if: failure() && matrix.e2e
+        uses: actions/upload-artifact@v7
+        with:
+          name: serial-${{ matrix.name }}
+          path: test/work/serial.log
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/db.key"
+
+      # Releases: hand image and ISO to the publish job, which only runs when
+      # every build and test passed. Nothing is published from here.
+      - name: Stage for publishing
+        if: env.RELEASE == 'true'
+        run: |
+          mkdir -p stage
+          sudo podman push -q --compression-format gzip --force-compression \
+            "$IMAGE" "oci:$PWD/stage/image:$TAG"
+          mv "build/kairos-alpine-${TAG}.iso" "build/kairos-alpine-${TAG}.iso.sha256" stage/
+          echo "$TAG" > stage/TAG
+          sudo chown -R "$USER" stage
+
+      - name: Upload staged release
+        if: env.RELEASE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.name }}
+          path: stage/
+          retention-days: 1
+          compression-level: 0
+
+  # Full Secure Boot flow in a VM with throwaway keys: enroll them with the
+  # enrollment ISO, install a signed image, boot it with Secure Boot enforcing.
+  secureboot-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman qemu-system-x86 qemu-utils ovmf
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build signed image and enrollment ISO with test keys
+        run: |
+          sudo -E secureboot/genkeys.sh test/work/sb
+          sudo -E env SB_CERTS=test/work/sb/certs SB_DB_KEY_FILE=test/work/sb/private/db.key \
+            CLOUD_CONFIG=test/cloud-config.yaml ISO_NAME=autoinstall-sb ARCH=amd64 ./build.sh >/dev/null
+          sudo -E env SB_DB_KEY_FILE=test/work/sb/private/db.key ISO_NAME=sb-enroll-test \
+            ENROLL_ARCHES=amd64 secureboot/build-enroll-iso.sh test/work/sb
+          sudo chown -R "$USER" build test/work
+
+      - name: Secure Boot install test
+        run: test/e2e.sh build/autoinstall-sb.iso core build/sb-enroll-test.iso
+
+      - name: Upload serial log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: serial-secureboot
+          path: test/work/serial.log
+
+  # Standalone ISO that enrolls the project's Secure Boot keys (amd64 + arm64).
+  enroll-iso:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELEASE: ${{ needs.prepare.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check for keys
+        run: |
+          if [[ -f secureboot/auth/PK.auth ]]; then
+            echo "HAVE_KEYS=1" >> "$GITHUB_ENV"
+          elif [[ $RELEASE == true ]]; then
+            echo "::error::No secureboot/auth/*.auth committed (see secureboot/genkeys.sh)"
+            exit 1
+          else
+            echo "::warning::No Secure Boot keys committed yet, skipping the enrollment ISO"
+          fi
+
+      - name: Set up QEMU user emulation
+        if: env.HAVE_KEYS
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Build enrollment ISO
+        if: env.HAVE_KEYS
+        env:
+          SB_DB_KEY: ${{ secrets.SB_DB_KEY }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq podman
+          if [[ -n $SB_DB_KEY ]]; then
+            install -m 600 /dev/null "$RUNNER_TEMP/db.key"
+            printf '%s\n' "$SB_DB_KEY" > "$RUNNER_TEMP/db.key"
+            export SB_DB_KEY_FILE="$RUNNER_TEMP/db.key"
+          elif [[ $RELEASE == true ]]; then
+            echo "::error::Releases must be signed: set the SB_DB_KEY secret"
+            exit 1
+          fi
+          sudo -E secureboot/build-enroll-iso.sh
+          rm -f "$RUNNER_TEMP/db.key"
+          sudo chown -R "$USER" build
+
+      - name: Upload artifact
+        if: env.HAVE_KEYS
+        uses: actions/upload-artifact@v7
+        with:
+          name: sb-enroll-iso
+          path: build/kairos-alpine-sb-enroll.iso*
+          retention-days: 7
+
+  # Runs only when everything above passed (the experimental riscv64 build may
+  # fail; it is then left out). Creates the release, or updates it on a rebuild.
+  publish:
+    needs: [prepare, build, secureboot-test, enroll-iso]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write   # GitHub release
+      packages: write   # GHCR
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq podman skopeo
+
+      # The staged builds add up to ~14 GB: use the runner's large /mnt disk.
+      - name: Prepare download location
+        run: sudo mkdir -p /mnt/stage && sudo chown "$USER" /mnt/stage
+
+      - name: Download staged builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: /mnt/stage
+
+      - name: Download enrollment ISO
+        uses: actions/download-artifact@v8
+        with:
+          name: sb-enroll-iso
+          path: isos
+
+      - name: Push images
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kairos-alpine"
+          echo "$GH_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          : > pushed
+          for c in core-amd64 standard-k3s-amd64 standard-k0s-amd64 \
+                   core-arm64 standard-k3s-arm64 standard-k0s-arm64 core-riscv64; do
+            dir="/mnt/stage/release-$c"
+            if [[ ! -f $dir/TAG ]]; then
+              [[ $c == *riscv64 ]] && { echo "::warning::no $c build, leaving it out"; continue; }
+              echo "::error::staged build $c missing"; exit 1
+            fi
+            tag=$(cat "$dir/TAG")
+            skopeo copy --retry-times 3 "oci:$dir/image:$tag" "docker://$repo:$tag"
+            echo "$repo:$tag" >> pushed
+            mv "$dir"/*.iso "$dir"/*.iso.sha256 isos/
+          done
+          cat pushed
+
+      # Multi-arch tags (e.g. 3.24-core-generic-v4.3.0) over the per-arch ones.
+      - name: Push multi-arch manifests
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kairos-alpine"
+          echo "$GH_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          for flavor in core standard-k3s standard-k0s; do
+            variant=${flavor%%-*}
+            suffix=""; [[ $flavor == standard-* ]] && suffix="-${flavor#standard-}"
+            list="$repo:${ALPINE_VERSION}-${variant}-generic-${RELEASE_TAG}${suffix}"
+            podman manifest create "$list"
+            grep -E ":${ALPINE_VERSION}-${variant}-[a-z0-9]+-generic-${RELEASE_TAG}${suffix}\$" pushed \
+              | while read -r ref; do podman manifest add "$list" "docker://$ref"; done
+            podman manifest push --all "$list" "docker://$list"
+          done
+
+      - name: Publish GitHub release
+        run: |
+          set -euo pipefail
+          ls -lh isos
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Rebuild of a published release: replace the assets, note it.
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber isos/*
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > notes.md
+            printf '\n- Rebuilt %s with current Alpine packages\n' "$(date -u +%F)" >> notes.md
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            cat > notes.md <<EOF
+          Kairos ${RELEASE_TAG} on Alpine ${ALPINE_VERSION}, built with the same kairos-init as the
+          upstream release: https://github.com/kairos-io/kairos/releases/tag/${RELEASE_TAG}
+
+          Images: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kairos-alpine:${ALPINE_VERSION}-{core,standard}-{amd64,arm64}-generic-${RELEASE_TAG}\` (standard: \`-k3s\` or \`-k0s\` suffix), riscv64 core when its build succeeded. For Secure Boot, enroll the keys with \`kairos-alpine-sb-enroll.iso\` first (see README).
+          EOF
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$RELEASE_TAG" --notes-file notes.md isos/*
+          fi
