@@ -33,7 +33,7 @@ Tag scheme (same as upstream Kairos):
 
 | Workflow | When | What |
 |----------|------|------|
-| `build.yml` | PRs, `main` | Builds every combination and runs VM install tests on amd64: one under Secure Boot, and on the standard variants until the Kubernetes node is Ready. Nothing is published. |
+| `build.yml` | PRs, `main` | Builds every combination and runs VM install tests on amd64: on the standard variants until the Kubernetes node is Ready, and under Secure Boot, with throwaway keys and, when the build is signed, with the project's keys. Nothing is published. |
 | `build.yml` | tag `vX.Y.Z` | A release. Checks that Kairos `vX.Y.Z` pins our kairos-init, then builds and tests. Publishes only if everything passed; the experimental riscv64 build is left out if it failed. |
 | `follow-kairos.yml` | daily | On a new Kairos release: bumps `KAIROS_INIT` on `main`, tags the version and starts the release build. |
 | `alpine-updates.yml` | daily | If the latest release's image has Alpine package updates, rebuilds that release and re-publishes it under the same tag. |
@@ -140,6 +140,9 @@ This creates the PK/KEK/db hierarchy:
 
 - Tag builds fail unless the certificates are committed and `SB_DB_KEY` is set.
   Other builds without the secret (e.g. PRs from forks) come out unsigned.
+- Signed builds are tested with these keys: CI enrolls `secureboot/auth/` in a
+  VM, then installs and boots the signed core image with Secure Boot
+  enforcing.
 - Local signed build: `SB_DB_KEY_FILE=secureboot/private/db.key ./build.sh`.
   The enrollment ISO: `SB_DB_KEY_FILE=... secureboot/build-enroll-iso.sh`.
 - Replacing the db key means rebuilding shim, so machines need the new keys

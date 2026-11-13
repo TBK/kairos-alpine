@@ -1,7 +1,8 @@
 name: Build
 
 # PRs / main: build every arch+variant, run the VM install test (amd64) and a
-#             Secure Boot install test with throwaway keys.
+#             Secure Boot install test with throwaway keys. Signed builds
+#             repeat the Secure Boot test with the project's keys.
 # Tag vX.Y.Z:  a release. X.Y.Z is the Kairos release whose kairos-init we pin
 #             (checked). Same builds and tests; only when all of them pass does
 #             "publish" push the images to GHCR and put the ISOs plus the
@@ -27,6 +28,12 @@ concurrency:
 
 permissions:
   contents: read
+
+# "bash" runs steps with -eo pipefail. GitHub's default shell has no pipefail,
+# so a failing command piped into tee or sed would not fail its step.
+defaults:
+  run:
+    shell: bash
 
 env:
   ALPINE_VERSION: '3.24'
@@ -70,17 +77,19 @@ jobs:
       fail-fast: false
       matrix:
         # The VM install test (amd64) starts Kubernetes on the standard
-        # variants and waits for a Ready node.
+        # variants and waits for a Ready node. sb_e2e: when the build is
+        # signed, repeat it under Secure Boot with the project's keys. Core
+        # only: all variants share the boot loaders and the kernel.
         include:
-          - { name: core-amd64,         arch: amd64,   variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: true,  experimental: false }
-          - { name: standard-k3s-amd64, arch: amd64,   variant: standard, provider: k3s, runner: ubuntu-24.04,     e2e: true,  experimental: false }
-          - { name: standard-k0s-amd64, arch: amd64,   variant: standard, provider: k0s, runner: ubuntu-24.04,     e2e: true,  experimental: false }
-          - { name: core-arm64,         arch: arm64,   variant: core,     provider: '',  runner: ubuntu-24.04-arm, e2e: false, experimental: false }
-          - { name: standard-k3s-arm64, arch: arm64,   variant: standard, provider: k3s, runner: ubuntu-24.04-arm, e2e: false, experimental: false }
-          - { name: standard-k0s-arm64, arch: arm64,   variant: standard, provider: k0s, runner: ubuntu-24.04-arm, e2e: false, experimental: false }
+          - { name: core-amd64,         arch: amd64,   variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: true,  sb_e2e: true,  experimental: false }
+          - { name: standard-k3s-amd64, arch: amd64,   variant: standard, provider: k3s, runner: ubuntu-24.04,     e2e: true,  sb_e2e: false, experimental: false }
+          - { name: standard-k0s-amd64, arch: amd64,   variant: standard, provider: k0s, runner: ubuntu-24.04,     e2e: true,  sb_e2e: false, experimental: false }
+          - { name: core-arm64,         arch: arm64,   variant: core,     provider: '',  runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false, experimental: false }
+          - { name: standard-k3s-arm64, arch: arm64,   variant: standard, provider: k3s, runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false, experimental: false }
+          - { name: standard-k0s-arm64, arch: arm64,   variant: standard, provider: k0s, runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false, experimental: false }
           # No native riscv64 runners: built under qemu-user emulation (slow).
           # No standard variants: k3s and k0s publish no riscv64 releases.
-          - { name: core-riscv64,       arch: riscv64, variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: false, experimental: true }
+          - { name: core-riscv64,       arch: riscv64, variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: false, sb_e2e: false, experimental: true }
     env:
       ARCH: ${{ matrix.arch }}
       VARIANT: ${{ matrix.variant }}
@@ -150,7 +159,24 @@ jobs:
           sudo -E env CLOUD_CONFIG="$config" ISO_NAME=autoinstall-test ./build.sh >/dev/null
           sudo chown -R "$USER" build
           test/e2e.sh build/autoinstall-test.iso "$VARIANT"
-          rm -f build/autoinstall-test.iso*
+
+      # The test above, repeated under Secure Boot with the project's keys:
+      # enroll the committed secureboot/auth files with an enrollment ISO
+      # built like the published one, then install and boot with Secure Boot
+      # enforcing. The ISO comes from the same cached image as the one this
+      # job publishes, so shim, GRUB and the kernel are the release binaries.
+      # (secureboot-test runs the same flow with throwaway keys, which also
+      # covers builds without the signing key, e.g. PRs from forks.)
+      - name: Secure Boot install test with the project keys
+        if: matrix.sb_e2e && env.SB_DB_KEY_FILE
+        run: |
+          sudo -E env ISO_NAME=sb-enroll-test ENROLL_ARCHES=amd64 secureboot/build-enroll-iso.sh
+          sudo chown -R "$USER" build
+          test/e2e.sh build/autoinstall-test.iso core build/sb-enroll-test.iso
+
+      - name: Remove VM test ISOs
+        if: matrix.e2e
+        run: rm -f build/autoinstall-test.iso* build/sb-enroll-test.iso*
 
       - name: Upload serial log on failure
         if: failure() && matrix.e2e
