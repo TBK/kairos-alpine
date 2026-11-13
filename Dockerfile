@@ -1,5 +1,7 @@
-# Kairos on Alpine Linux, generic model. Multi-arch: amd64, arm64, riscv64.
-ARG KAIROS_INIT=v0.17.3
+# Kairos on Alpine Linux, generic model. Multi-arch: amd64, arm64.
+# Kairos builds release vX.Y.Z with kairos-init vX.Y.Z, so this is the Kairos
+# release we follow (follow-kairos.yml bumps it, build.yml checks it on tags).
+ARG KAIROS_INIT=v4.5.0
 ARG ALPINE_VERSION=3.24
 
 FROM quay.io/kairos/kairos-init:${KAIROS_INIT} AS kairos-init
@@ -9,7 +11,7 @@ FROM quay.io/kairos/kairos-init:${KAIROS_INIT} AS kairos-init
 # verifies GRUB and GRUB asks shim to verify the kernel. Alpine has no shim
 # package and ours can't be signed by Microsoft, so the machine needs the
 # project keys enrolled (secureboot/). Skipped when there is no certificate
-# yet, and on riscv64 (shim doesn't support it).
+# yet.
 FROM docker.io/library/alpine:${ALPINE_VERSION} AS shim
 ARG TARGETARCH
 ARG SHIM_VERSION=16.1
@@ -18,7 +20,7 @@ ARG SHIM_SHA256=46319cd228d8f2c06c744241c0f342412329a7c630436fce7f82cf6936b1d603
 ARG SB_CERTS=secureboot/certs
 COPY ${SB_CERTS}/ /out/certs/
 RUN set -e; \
-    if [ ! -f /out/certs/db.der ] || [ "$TARGETARCH" = riscv64 ]; then \
+    if [ ! -f /out/certs/db.der ]; then \
         echo "not building shim"; exit 0; \
     fi; \
     apk add --no-cache build-base bash curl bzip2 elfutils-dev dos2unix openssl-dev perl util-linux-misc; \
@@ -28,29 +30,6 @@ RUN set -e; \
     tar xjf shim.tar.bz2; cd "shim-${SHIM_VERSION}"; \
     make -j"$(nproc)" VENDOR_CERT_FILE=/out/certs/db.der DEFAULT_LOADER='\\grub.efi'; \
     cp shim*.efi /out/; ls -l /out
-
-# provider-kairos rebuilt with patches/kairos-sdk-openrc-k0s.patch, for the k0s
-# variant only: upstream's OpenRC support can't start k0s. PROVIDER_KAIROS must
-# be the version kairos-init installs (checked below). Built for the target
-# platform, not cross-compiled: with "FROM --platform=$BUILDPLATFORM" here,
-# podman 4.9 (Ubuntu 24.04, CI) built the riscv64 image on amd64 Alpine.
-FROM docker.io/library/golang:1.26-alpine AS provider
-ARG TARGETARCH
-ARG K8S_PROVIDER=""
-ARG PROVIDER_KAIROS=v2.16.4
-COPY patches/kairos-sdk-openrc-k0s.patch /patches/
-RUN set -e; mkdir -p /out; \
-    if [ "$K8S_PROVIDER" != k0s ]; then echo "not building provider-kairos"; exit 0; fi; \
-    apk add --no-cache git patch; \
-    git clone -q --depth 1 --branch "$PROVIDER_KAIROS" https://github.com/kairos-io/provider-kairos /src; \
-    cd /src; \
-    sdk=$(go mod download -json github.com/kairos-io/kairos-sdk | sed -n 's/.*"Dir": "\(.*\)".*/\1/p'); \
-    cp -r "$sdk" /sdk; chmod -R u+w /sdk; \
-    patch -d /sdk -p1 --no-backup-if-mismatch < /patches/kairos-sdk-openrc-k0s.patch; \
-    go mod edit -replace github.com/kairos-io/kairos-sdk=/sdk; \
-    CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" go build -trimpath \
-      -ldflags "-w -s -X github.com/kairos-io/provider-kairos/v2/internal/cli.VERSION=${PROVIDER_KAIROS}" \
-      -o /out/agent-provider-kairos .
 
 FROM docker.io/library/alpine:${ALPINE_VERSION}
 ARG TARGETARCH
@@ -93,16 +72,6 @@ RUN want=$(case "$TARGETARCH" in amd64) echo x86_64;; arm64) echo aarch64;; *) e
 # Extra packages you want on the server go here
 # RUN apk add --no-cache htop
 
-# kairos-init installs VMware guest tools on every arch, but Alpine doesn't
-# build them for riscv64 and apk fails on the missing names. Satisfy them with
-# empty placeholder packages.
-RUN if [ "$TARGETARCH" = riscv64 ]; then \
-        for p in open-vm-tools open-vm-tools-deploypkg open-vm-tools-guestinfo \
-                 open-vm-tools-static open-vm-tools-vmbackup; do \
-            apk add --no-cache --virtual "$p"; \
-        done; \
-    fi
-
 RUN --mount=type=bind,from=kairos-init,src=/kairos-init,dst=/kairos-init \
     set -e; args=""; \
     if [ -n "$K8S_PROVIDER" ]; then \
@@ -126,30 +95,6 @@ RUN set -e; \
 # Fix the default hostname on OpenRC (see the file).
 COPY files/system/oem/32_openrc-hostname.yaml /system/oem/
 
-# k0s on OpenRC: install the patched provider-kairos (see the provider stage)
-# and let the k0s init scripts take the arguments and environment Kairos
-# computes, from /etc/k0s/<service>.args and .env. Upstream's scripts hardcode
-# the arguments.
-RUN --mount=type=bind,from=provider,src=/out,dst=/provider \
-    set -e; \
-    [ -f /provider/agent-provider-kairos ] || exit 0; \
-    want=$(/provider/agent-provider-kairos --version | sed -n 's/^version: \([^,]*\),.*/\1/p'); \
-    have=$(/system/providers/agent-provider-kairos --version | sed -n 's/^version: \([^,]*\),.*/\1/p'); \
-    if [ "$want" != "$have" ]; then \
-        echo "kairos-init installed provider-kairos $have, but PROVIDER_KAIROS is $want: update it"; exit 1; \
-    fi; \
-    install -m 0755 /provider/agent-provider-kairos /system/providers/agent-provider-kairos; \
-    printf '%s\n' \
-      '[ -f "/etc/k0s/${RC_SVCNAME}.args" ] && . "/etc/k0s/${RC_SVCNAME}.args"' \
-      'if [ -f "/etc/k0s/${RC_SVCNAME}.env" ]; then set -a; . "/etc/k0s/${RC_SVCNAME}.env"; set +a; fi' \
-      > /tmp/k0s-args.sh; \
-    for svc in k0scontroller k0sworker; do \
-        grep -q '^command_args=' "/etc/init.d/$svc"; \
-        sed -i '/^command_args=/r /tmp/k0s-args.sh' "/etc/init.d/$svc"; \
-    done; \
-    rm /tmp/k0s-args.sh; \
-    cat /etc/init.d/k0scontroller
-
 # Boot loader. Alpine's grub-efi ships only modules, no prebuilt GRUB EFI
 # binary, so build a standalone one and put it where kairos-agent and
 # AuroraBoot look (SUSE layout): shim.efi is copied to the removable-media
@@ -166,7 +111,6 @@ RUN --mount=type=bind,from=shim,src=/out,dst=/shim \
     case "$TARGETARCH" in \
       amd64)   fmt=x86_64-efi;  dir=x86_64 ;; \
       arm64)   fmt=arm64-efi;   dir=aarch64 ;; \
-      riscv64) fmt=riscv64-efi; dir=riscv64 ;; \
       *) echo "unsupported arch $TARGETARCH"; exit 1 ;; \
     esac; \
     d=/usr/lib/grub/$fmt; mods=""; \

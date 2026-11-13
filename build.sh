@@ -4,7 +4,7 @@
 # Env:
 #   VERSION         semver of the OS image (bump for upgrades)          [1.0.0]
 #   ALPINE_VERSION  Alpine base tag                                     [3.24]
-#   ARCH            amd64 | arm64 | riscv64 (non-native needs qemu-user) [host]
+#   ARCH            amd64 | arm64 (non-native needs qemu-user)           [host]
 #   VARIANT         core | standard (standard = with Kubernetes)        [core]
 #   K8S_PROVIDER    k3s | k0s, used by the standard variant             [k3s]
 #   K8S_VERSION     pin the Kubernetes version (empty = provider default)
@@ -25,7 +25,7 @@ as_ns() { if [[ $(id -u) == 0 ]]; then "$@"; else podman unshare "$@"; fi; }
 
 host_arch() {
   case "$(uname -m)" in
-    x86_64) echo amd64 ;; aarch64) echo arm64 ;; riscv64) echo riscv64 ;;
+    x86_64) echo amd64 ;; aarch64) echo arm64 ;;
     *) uname -m ;;
   esac
 }

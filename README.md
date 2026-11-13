@@ -1,20 +1,22 @@
 # Kairos on Alpine
 
 Builds [Kairos](https://kairos.io) images (immutable Alpine) and installer ISOs
-for amd64, arm64 and riscv64 (experimental), as a *core* variant (no Kubernetes)
-and *standard* variants with k3s or k0s (amd64 and arm64).
+for amd64 and arm64, as a *core* variant (no Kubernetes) and *standard*
+variants with k3s or k0s. Releases up to v4.4.0 also had an experimental
+riscv64 core image; Kairos no longer publishes kairos-init for riscv64.
 
 | Component   | Version |
 |-------------|---------|
 | Alpine      | 3.24    |
-| kairos-init | v0.17.3 |
+| kairos-init | v4.5.0  |
 | AuroraBoot  | v0.27.1 |
 | shim        | 16.1    |
 
 ## Pre-built images
 
-Releases follow Kairos: release `vX.Y.Z` is built with the same kairos-init,
-and so the same Kairos components, as the upstream Kairos release `vX.Y.Z`.
+Releases follow Kairos: release `vX.Y.Z` is built with kairos-init `vX.Y.Z`,
+the one upstream builds Kairos `vX.Y.Z` with, and so with the same Kairos
+components.
 Each release publishes:
 
 - **ISOs** on the GitHub release: `kairos-alpine-<tag>.iso`, plus
@@ -34,7 +36,7 @@ Tag scheme (same as upstream Kairos):
 | Workflow | When | What |
 |----------|------|------|
 | `build.yml` | PRs, `main` | Builds every combination and runs VM install tests on amd64: on the standard variants until the Kubernetes node is Ready, and under Secure Boot, with throwaway keys and, when the build is signed, with the project's keys. Nothing is published. |
-| `build.yml` | tag `vX.Y.Z` | A release. Checks that Kairos `vX.Y.Z` pins our kairos-init, then builds and tests. Publishes only if everything passed; the experimental riscv64 build is left out if it failed. |
+| `build.yml` | tag `vX.Y.Z` | A release. Checks that `vX.Y.Z` is a Kairos release and that the `Dockerfile` pins kairos-init `vX.Y.Z`, then builds and tests. Publishes only if everything passed. |
 | `follow-kairos.yml` | daily | On a new Kairos release: bumps `KAIROS_INIT` on `main`, tags the version and starts the release build. |
 | `alpine-updates.yml` | daily | If the latest release's image has Alpine package updates, rebuilds that release and re-publishes it under the same tag. |
 
@@ -147,7 +149,6 @@ This creates the PK/KEK/db hierarchy:
   The enrollment ISO: `SB_DB_KEY_FILE=... secureboot/build-enroll-iso.sh`.
 - Replacing the db key means rebuilding shim, so machines need the new keys
   enrolled again.
-- riscv64 images are never signed, because shim doesn't support riscv64.
 
 ## Alpine-specific fixes
 
@@ -163,15 +164,6 @@ kairos-init Alpine image has several problems. The `Dockerfile` fixes them:
   hostname is derived from the machine ID before OpenRC systems have one.
   `files/system/oem/32_openrc-hostname.yaml` creates the machine ID first, and
   repairs machines already installed with that hostname.
-- **k0s never starts.** Kairos's OpenRC support only knows k3s. The k0s variant
-  rebuilds provider-kairos with `patches/kairos-sdk-openrc-k0s.patch`, and its
-  init scripts take the arguments and environment from Kairos's config. Set
-  `k0s.args: [--single]` for a single-node cluster. `follow-kairos` keeps the
-  rebuilt provider version (`PROVIDER_KAIROS`) in step with kairos-init. When a
-  kairos-sdk release fixes this upstream, the patch stops applying and the
-  build fails; then drop it.
-- **riscv64 builds fail**, because kairos-init installs VMware tools Alpine
-  doesn't build for riscv64. They're satisfied with empty placeholder packages.
 - **The initramfs carries all GPU drivers and firmware** (mkinitfs `kms`
   feature). It's rebuilt without them.
 

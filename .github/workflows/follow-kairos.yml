@@ -1,9 +1,8 @@
 name: Follow Kairos releases
 
-# Daily: when Kairos publishes a release (vX.Y.Z), pin the kairos-init it uses
-# (and the provider-kairos that kairos-init bundles, which our k0s patch
-# rebuilds), tag vX.Y.Z on main and start the release build (build.yml), which
-# checks, tests and publishes it.
+# Daily: when Kairos publishes a release (vX.Y.Z), pin kairos-init vX.Y.Z,
+# which Kairos builds that release with, tag vX.Y.Z on main and start the
+# release build (build.yml), which checks, tests and publishes it.
 #
 # If that build failed, the tag stays without a GitHub release. The next run
 # retries once main has moved on (i.e. after a fix was pushed): it moves the
@@ -54,19 +53,17 @@ jobs:
             exit 0
           fi
 
-          init=$(curl -fsSL "https://raw.githubusercontent.com/kairos-io/kairos/$latest/images/Dockerfile" \
-            | sed -n 's/^ARG KAIROS_INIT=//p')
-          [[ -n $init ]] || { echo "::error::no KAIROS_INIT in Kairos $latest images/Dockerfile"; exit 1; }
-          provider=$(docker run --rm "quay.io/kairos/kairos-init:$init" version 2>&1 \
-            | grep -o 'provider-kairos: v[0-9.]*' | cut -d' ' -f2)
-          [[ -n $provider ]] || { echo "::error::no provider-kairos version in kairos-init $init"; exit 1; }
+          # Kairos's release run publishes kairos-init with the release's tag
+          # and builds the release with it. (KAIROS_INIT in Kairos's
+          # images/Dockerfile is only a fallback for other builds and lags.)
+          docker manifest inspect "quay.io/kairos/kairos-init:$latest" >/dev/null \
+            || { echo "::error::no image quay.io/kairos/kairos-init:$latest"; exit 1; }
 
-          sed -i -e "s/^ARG KAIROS_INIT=.*/ARG KAIROS_INIT=$init/" \
-                 -e "s/^ARG PROVIDER_KAIROS=.*/ARG PROVIDER_KAIROS=$provider/" Dockerfile
+          sed -i "s/^ARG KAIROS_INIT=.*/ARG KAIROS_INIT=$latest/" Dockerfile
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if ! git diff --quiet Dockerfile; then
-            git commit -q -m "Follow Kairos $latest: kairos-init $init, provider-kairos $provider" Dockerfile
+            git commit -q -m "Follow Kairos $latest" Dockerfile
             git push origin HEAD:main
           fi
 

@@ -49,15 +49,18 @@ jobs:
 
       - name: Version
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [[ $GITHUB_REF == refs/tags/v* ]]; then
-            # The tag names the Kairos release; it must pin the same kairos-init.
-            ours=$(sed -n 's/^ARG KAIROS_INIT=//p' Dockerfile)
-            upstream=$(curl -fsSL "https://raw.githubusercontent.com/kairos-io/kairos/$GITHUB_REF_NAME/images/Dockerfile" \
-              | sed -n 's/^ARG KAIROS_INIT=//p') \
+            # The tag names the Kairos release. Kairos builds release vX.Y.Z
+            # with kairos-init vX.Y.Z (KAIROS_INIT in its images/Dockerfile is
+            # only a fallback), so that is what our Dockerfile must pin.
+            gh release view "$GITHUB_REF_NAME" --repo kairos-io/kairos >/dev/null \
               || { echo "::error::$GITHUB_REF_NAME is not a Kairos release"; exit 1; }
-            if [[ $ours != "$upstream" ]]; then
-              echo "::error::Kairos $GITHUB_REF_NAME uses kairos-init $upstream, our Dockerfile has $ours"
+            ours=$(sed -n 's/^ARG KAIROS_INIT=//p' Dockerfile)
+            if [[ $ours != "$GITHUB_REF_NAME" ]]; then
+              echo "::error::Kairos $GITHUB_REF_NAME is built with kairos-init $GITHUB_REF_NAME, our Dockerfile has $ours"
               exit 1
             fi
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
@@ -71,7 +74,6 @@ jobs:
     name: ${{ matrix.name }}
     needs: prepare
     runs-on: ${{ matrix.runner }}
-    continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -80,16 +82,14 @@ jobs:
         # variants and waits for a Ready node. sb_e2e: when the build is
         # signed, repeat it under Secure Boot with the project's keys. Core
         # only: all variants share the boot loaders and the kernel.
+        # No riscv64: Kairos publishes kairos-init for amd64 and arm64 only.
         include:
-          - { name: core-amd64,         arch: amd64,   variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: true,  sb_e2e: true,  experimental: false }
-          - { name: standard-k3s-amd64, arch: amd64,   variant: standard, provider: k3s, runner: ubuntu-24.04,     e2e: true,  sb_e2e: false, experimental: false }
-          - { name: standard-k0s-amd64, arch: amd64,   variant: standard, provider: k0s, runner: ubuntu-24.04,     e2e: true,  sb_e2e: false, experimental: false }
-          - { name: core-arm64,         arch: arm64,   variant: core,     provider: '',  runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false, experimental: false }
-          - { name: standard-k3s-arm64, arch: arm64,   variant: standard, provider: k3s, runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false, experimental: false }
-          - { name: standard-k0s-arm64, arch: arm64,   variant: standard, provider: k0s, runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false, experimental: false }
-          # No native riscv64 runners: built under qemu-user emulation (slow).
-          # No standard variants: k3s and k0s publish no riscv64 releases.
-          - { name: core-riscv64,       arch: riscv64, variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: false, sb_e2e: false, experimental: true }
+          - { name: core-amd64,         arch: amd64, variant: core,     provider: '',  runner: ubuntu-24.04,     e2e: true,  sb_e2e: true  }
+          - { name: standard-k3s-amd64, arch: amd64, variant: standard, provider: k3s, runner: ubuntu-24.04,     e2e: true,  sb_e2e: false }
+          - { name: standard-k0s-amd64, arch: amd64, variant: standard, provider: k0s, runner: ubuntu-24.04,     e2e: true,  sb_e2e: false }
+          - { name: core-arm64,         arch: arm64, variant: core,     provider: '',  runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false }
+          - { name: standard-k3s-arm64, arch: arm64, variant: standard, provider: k3s, runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false }
+          - { name: standard-k0s-arm64, arch: arm64, variant: standard, provider: k0s, runner: ubuntu-24.04-arm, e2e: false, sb_e2e: false }
     env:
       ARCH: ${{ matrix.arch }}
       VARIANT: ${{ matrix.variant }}
@@ -111,15 +111,7 @@ jobs:
           if ${{ matrix.e2e }}; then pkgs+=(qemu-system-x86 qemu-utils ovmf); fi
           sudo apt-get install -y -qq "${pkgs[@]}"
 
-      - name: Set up QEMU user emulation
-        if: matrix.arch == 'riscv64'
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: riscv64
-
-      # shim needs the certificate, and riscv64 has no shim: never signed.
       - name: Secure Boot signing key
-        if: matrix.arch != 'riscv64'
         env:
           SB_DB_KEY: ${{ secrets.SB_DB_KEY }}
         run: |
@@ -301,8 +293,8 @@ jobs:
           path: build/kairos-alpine-sb-enroll.iso*
           retention-days: 7
 
-  # Runs only when everything above passed (the experimental riscv64 build may
-  # fail; it is then left out). Creates the release, or updates it on a rebuild.
+  # Runs only when everything above passed. Creates the release, or updates it
+  # on a rebuild.
   publish:
     needs: [prepare, build, secureboot-test, enroll-iso]
     if: needs.prepare.outputs.release == 'true'
@@ -341,12 +333,9 @@ jobs:
           echo "$GH_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           : > pushed
           for c in core-amd64 standard-k3s-amd64 standard-k0s-amd64 \
-                   core-arm64 standard-k3s-arm64 standard-k0s-arm64 core-riscv64; do
+                   core-arm64 standard-k3s-arm64 standard-k0s-arm64; do
             dir="/mnt/stage/release-$c"
-            if [[ ! -f $dir/TAG ]]; then
-              [[ $c == *riscv64 ]] && { echo "::warning::no $c build, leaving it out"; continue; }
-              echo "::error::staged build $c missing"; exit 1
-            fi
+            [[ -f $dir/TAG ]] || { echo "::error::staged build $c missing"; exit 1; }
             tag=$(cat "$dir/TAG")
             skopeo copy --retry-times 3 "oci:$dir/image:$tag" "docker://$repo:$tag"
             echo "$repo:$tag" >> pushed
@@ -385,7 +374,7 @@ jobs:
           Kairos ${RELEASE_TAG} on Alpine ${ALPINE_VERSION}, built with the same kairos-init as the
           upstream release: https://github.com/kairos-io/kairos/releases/tag/${RELEASE_TAG}
 
-          Images: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kairos-alpine:${ALPINE_VERSION}-{core,standard}-{amd64,arm64}-generic-${RELEASE_TAG}\` (standard: \`-k3s\` or \`-k0s\` suffix), riscv64 core when its build succeeded. For Secure Boot, enroll the keys with \`kairos-alpine-sb-enroll.iso\` first (see README).
+          Images: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kairos-alpine:${ALPINE_VERSION}-{core,standard}-{amd64,arm64}-generic-${RELEASE_TAG}\` (standard: \`-k3s\` or \`-k0s\` suffix). For Secure Boot, enroll the keys with \`kairos-alpine-sb-enroll.iso\` first (see README).
           EOF
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "$RELEASE_TAG" --notes-file notes.md isos/*
