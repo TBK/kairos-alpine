@@ -1,7 +1,7 @@
 # Kairos on Alpine Linux, generic model. Multi-arch: amd64, arm64.
 # Kairos builds release vX.Y.Z with kairos-init vX.Y.Z, so this is the Kairos
 # release we follow (follow-kairos.yml bumps it, build.yml checks it on tags).
-ARG KAIROS_INIT=v4.5.0
+ARG KAIROS_INIT=v4.5.2
 ARG ALPINE_VERSION=3.24
 
 FROM quay.io/kairos/kairos-init:${KAIROS_INIT} AS kairos-init
